@@ -20,8 +20,11 @@ of its provider:
 
 | Model | Enabled | Disabled |
 |---|---|---|
-| GPT family (case-insensitive) | All seven Codex tools above | `bash`, `edit`, `write` |
-| Other models, or no model | `bash`, `edit`, `write` | All seven Codex tools |
+| GPT family (case-insensitive) | `exec_command`, `write_stdin`, `apply_patch`, `view_image` | `bash`, `edit`, `write` |
+| Other models, or no model | `bash`, `edit`, `write` | All Codex tools |
+
+`shell`, `shell_command` and `local_shell` stay registered (for SSH routing and old
+sessions) but are never activated; `exec_command` covers them.
 
 `read` stays enabled in both modes. Other active tools, including Web/image tools,
 SSH controls, monitors, goals and codemode, are preserved. Optional built-in

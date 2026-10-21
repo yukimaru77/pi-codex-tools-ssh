@@ -1,12 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent'
 
-export const CODEX_TOOL_NAMES = [
-  'shell', 'local_shell', 'shell_command', 'exec_command',
-  'write_stdin', 'apply_patch', 'view_image',
-] as const
+export const CODEX_TOOL_NAMES = ['exec_command', 'write_stdin', 'apply_patch', 'view_image'] as const
+/** Registered for compatibility but never activated: exec_command covers them. */
+export const LEGACY_SHELL_TOOL_NAMES = ['shell', 'local_shell', 'shell_command'] as const
 export const STANDARD_TOOL_NAMES = ['bash', 'edit', 'write'] as const
 const REQUIRED_CODEX_TOOLS = ['exec_command', 'write_stdin', 'apply_patch'] as const
-const MANAGED_TOOLS = new Set<string>([...CODEX_TOOL_NAMES, ...STANDARD_TOOL_NAMES])
+const MANAGED_TOOLS = new Set<string>([...CODEX_TOOL_NAMES, ...LEGACY_SHELL_TOOL_NAMES, ...STANDARD_TOOL_NAMES])
 export const TOOL_STATUS_KEY = 'codex-tools'
 
 type ModelIdentity = { id?: string; name?: string } | undefined

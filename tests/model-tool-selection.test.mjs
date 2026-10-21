@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { CODEX_TOOL_NAMES, STANDARD_TOOL_NAMES, isGptModel, selectModelTools, registerModelToolSelection } from '../src/model-tool-selection.ts'
+import { CODEX_TOOL_NAMES, LEGACY_SHELL_TOOL_NAMES, STANDARD_TOOL_NAMES, isGptModel, selectModelTools, registerModelToolSelection } from '../src/model-tool-selection.ts'
 
-const available = ['read', ...STANDARD_TOOL_NAMES, ...CODEX_TOOL_NAMES, 'codemode', 'web_run', 'codex_generate_image', 'ssh_connect', 'monitor_start', 'get_goal'].map(name => ({ name, exposure: 'direct' }))
+const available = ['read', ...STANDARD_TOOL_NAMES, ...CODEX_TOOL_NAMES, ...LEGACY_SHELL_TOOL_NAMES, 'codemode', 'web_run', 'codex_generate_image', 'ssh_connect', 'monitor_start', 'get_goal'].map(name => ({ name, exposure: 'direct' }))
 const base = ['read', ...STANDARD_TOOL_NAMES, ...CODEX_TOOL_NAMES, 'web_run', 'codex_generate_image', 'ssh_connect', 'codemode', 'monitor_start', 'get_goal']
 
 for (const model of [
@@ -29,6 +29,14 @@ test('exclusive loadouts, shared read and unrelated extensions preserved', () =>
     assert.ok(codex.tools.includes(name)); assert.ok(standard.tools.includes(name))
   }
   assert.deepEqual(selectModelTools({ id: 'gpt-6.1-sol' }, standard.tools, available).tools, codex.tools)
+})
+
+test('legacy shell aliases stay registered but inactive in both modes', () => {
+  const withLegacy = [...base, ...LEGACY_SHELL_TOOL_NAMES]
+  for (const model of [{ id: 'gpt-6.1-sol' }, { id: 'deepseek-v4.1' }]) {
+    const { tools } = selectModelTools(model, withLegacy, available)
+    for (const name of LEGACY_SHELL_TOOL_NAMES) assert.ok(!tools.includes(name))
+  }
 })
 
 test('partial/hidden Codex registration falls back to registered standard tools', () => {
