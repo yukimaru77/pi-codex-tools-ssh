@@ -6,6 +6,7 @@ import path from 'node:path'
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ToolDefinition,
 } from '@earendil-works/pi-coding-agent'
 import {
   DEFAULT_MAX_BYTES,
@@ -15,11 +16,11 @@ import {
   withFileMutationQueue,
 } from '@earendil-works/pi-coding-agent'
 import { type Static, Type } from 'typebox'
+import { registerModelToolSelection, TOOL_STATUS_KEY } from './model-tool-selection.ts'
 
 const DEFAULT_EXEC_YIELD_TIME_MS = 10_000
 const DEFAULT_WRITE_STDIN_YIELD_TIME_MS = 250
 const DEFAULT_SHELL_TIMEOUT_MS = 60_000
-const CODEX_TOOLS_STATUS_KEY = 'codex-tools'
 
 const permissionProfileSchema = Type.Optional(
   Type.Object(
@@ -168,7 +169,7 @@ const execCommandSchema = Type.Object(
     environment_id: Type.Optional(
       Type.String({
         description:
-          'Optional environment id from the <environment_context> block. Accepted for Codex compatibility; Pi uses the local environment.',
+          'Optional environment id. SSH Remote validates this against the active SSH workspace; omit to use the current workspace.',
       }),
     ),
     ...approvalParameters,
@@ -877,7 +878,38 @@ function prepareApplyPatchArguments(args: unknown): ApplyPatchArgs {
 }
 
 export default function codexTools(pi: ExtensionAPI) {
-  pi.registerTool({
+  // The workspace owner may supply an execution backend. Resolve per call so
+  // changing SSH targets never relies on extension registration order.
+  pi.events.on('codex-tools:capabilities', (value: unknown) => {
+    if (value && typeof value === 'object') (value as { protocolVersion: number }).protocolVersion = 1
+  })
+  function registerRoutedTool(definition: ToolDefinition<any, any>) {
+    pi.registerTool({
+      ...definition,
+      promptGuidelines: [
+        ...(definition.promptGuidelines ?? []),
+        'When SSH Remote is active, these Codex-compatible tools use the remote workspace, including local_shell. write_stdin always addresses the process that produced its session_id, even after switching workspaces.',
+      ],
+      async execute(id, params, signal, onUpdate, ctx) {
+        const request: {
+          protocolVersion: number
+          name: string
+          params: any
+          context: ExtensionContext
+          signal?: AbortSignal
+          execute?: () => ReturnType<typeof definition.execute>
+        } = { protocolVersion: 1, name: definition.name, params, context: ctx, signal }
+        pi.events.emit('codex-tools:resolve', request)
+        if (!request.execute && params.environment_id !== undefined && params.environment_id !== 'local') {
+          throw new Error('No active workspace backend for the requested environment_id')
+        }
+        return request.execute
+          ? request.execute()
+          : definition.execute(id, params, signal, onUpdate, ctx)
+      },
+    })
+  }
+  registerRoutedTool({
     name: 'shell',
     label: 'Shell',
     description:
@@ -896,7 +928,7 @@ export default function codexTools(pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  registerRoutedTool({
     name: 'local_shell',
     label: 'Local Shell',
     description:
@@ -915,7 +947,7 @@ export default function codexTools(pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  registerRoutedTool({
     name: 'shell_command',
     label: 'Shell Command',
     description:
@@ -939,7 +971,7 @@ export default function codexTools(pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  registerRoutedTool({
     name: 'exec_command',
     label: 'Exec Command',
     description:
@@ -982,7 +1014,7 @@ export default function codexTools(pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  registerRoutedTool({
     name: 'write_stdin',
     label: 'Write Stdin',
     description:
@@ -1017,7 +1049,7 @@ export default function codexTools(pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  registerRoutedTool({
     name: 'apply_patch',
     label: 'Apply Patch',
     description: `Use the \`apply_patch\` tool to edit files.
@@ -1047,7 +1079,7 @@ File references can only be relative, never absolute.`,
     },
   })
 
-  pi.registerTool({
+  registerRoutedTool({
     name: 'view_image',
     label: 'View Image',
     description:
@@ -1079,9 +1111,7 @@ File references can only be relative, never absolute.`,
     },
   })
 
-  pi.on('session_start', async (_event, ctx) => {
-    if (ctx.hasUI) ctx.ui.setStatus(CODEX_TOOLS_STATUS_KEY, 'codex tools')
-  })
+  registerModelToolSelection(pi)
 
   pi.on('session_shutdown', async (_event, ctx) => {
     for (const session of runningSessions.values()) {
@@ -1089,6 +1119,6 @@ File references can only be relative, never absolute.`,
       session.child.kill('SIGTERM')
     }
     runningSessions.clear()
-    if (ctx.hasUI) ctx.ui.setStatus(CODEX_TOOLS_STATUS_KEY, undefined)
+    if (ctx.hasUI) ctx.ui.setStatus(TOOL_STATUS_KEY, undefined)
   })
 }
