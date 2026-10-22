@@ -55,6 +55,22 @@ The shared `~/.pi/agent/APPEND_SYSTEM.md` now has tool-availability-conditional 
 instead of always requiring Codex tools. No authentication/model settings or DSH
 configuration are changed.
 
+## Long-running exec sessions
+
+`exec_command` still waits `yield_time_ms` (10 s by default) and returns the output and exit
+code of a command that finishes in time. A command still running then keeps running and the
+result carries its `session_id`, as before; in addition the session is now watched:
+
+- every 30 minutes, the session is woken with the output produced since the previous report
+  that the agent has not already read with `write_stdin` (first 3 / last 20 lines, 256-byte lines,
+  silent when there is no new output), with the session ID;
+- when the process exits, one final notice carries the remaining output and the exit code,
+  unless the agent already received the exit through `write_stdin`.
+
+`write_stdin` can still read or interact at any time. SSH sessions report the same way through
+the `codex-tools:observe` protocol of the patched pi-ssh-remote. Notifications also emit
+`pi-monitor:notification` and count in `pi-monitor:query`, so pi-goal-x `GOAL_WAIT` waits on them.
+
 ## Local verification
 
 Tested with Pi 1.1.0 / Node 26 on this machine, without any provider network calls:

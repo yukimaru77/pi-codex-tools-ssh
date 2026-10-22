@@ -17,6 +17,7 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { type Static, Type } from 'typebox'
 import { registerModelToolSelection, TOOL_STATUS_KEY } from './model-tool-selection.ts'
+import { ExecWatch, type ExecObserver, formatNotice, logFileReader, type SessionState } from './exec-watch.ts'
 
 const DEFAULT_EXEC_YIELD_TIME_MS = 10_000
 const DEFAULT_WRITE_STDIN_YIELD_TIME_MS = 250
@@ -877,7 +878,70 @@ function prepareApplyPatchArguments(args: unknown): ApplyPatchArgs {
   return { input: String(args ?? '') }
 }
 
+/** Observer for a local session; reads skip output the agent already received. */
+function localObserver(session: RunningSession): ExecObserver {
+  let offset = 0
+  return {
+    read() {
+      const start = Math.max(offset, session.readOffset)
+      offset = session.output.length
+      return session.output.slice(start)
+    },
+    completion: session.done,
+    state: () => ({ done: session.exitCode !== undefined, exitCode: session.exitCode }),
+    consumedByAgent: () => !runningSessions.has(session.id),
+  }
+}
+
 export default function codexTools(pi: ExtensionAPI) {
+  // A long exec_command session keeps running after its yield and reports back
+  // on its own: every 30 minutes with new output and once when it exits.
+  const watches = new Map<number, ExecWatch>()
+  let notificationSequence = 0
+  pi.events.on('codex-tools:observe', (value: unknown) => {
+    const request = value as { protocolVersion?: number; session_id?: number; observer?: ExecObserver }
+    if (!request || request.protocolVersion !== 1 || request.observer) return
+    const session = runningSessions.get(Number(request.session_id))
+    if (session) request.observer = localObserver(session)
+  })
+  // Additive so pi-event-monitor's path watchers and these sessions both count for goal waits.
+  pi.events.on('pi-monitor:query', (value: unknown) => {
+    const query = value as { active?: number; sequence?: number }
+    if (!query || typeof query !== 'object') return
+    query.active = (query.active ?? 0) + [...watches.values()].filter(watch => !watch.stopped).length
+    query.sequence = (query.sequence ?? 0) + notificationSequence
+  })
+  function watchSession(sessionId: number, command: string) {
+    if (watches.has(sessionId)) return
+    // A backend answers with a ready observer, or (SSH) with the local log of the session.
+    const request: {
+      protocolVersion: number
+      session_id: number
+      observer?: ExecObserver
+      log?: { path: string; completion: Promise<void>; state(): SessionState; consumedByAgent(): boolean }
+    } = { protocolVersion: 1, session_id: sessionId }
+    pi.events.emit('codex-tools:observe', request)
+    if (!request.observer && request.log) {
+      const { path: logPath, completion, state, consumedByAgent } = request.log
+      request.observer = { read: logFileReader(logPath), completion, state, consumedByAgent }
+    }
+    if (!request.observer) return
+    const watch = new ExecWatch({
+      sessionId, command, observer: request.observer,
+      notify(notice) {
+        if (notice.final) watches.delete(sessionId)
+        const sequence = ++notificationSequence
+        pi.events.emit('pi-monitor:notification', { id: `exec-${sessionId}`, sequence })
+        pi.sendMessage(
+          { customType: 'monitor-event', content: formatNotice(notice), display: true, details: { sessionId, command, lines: notice.lines, final: notice.final, sequence } },
+          { deliverAs: 'steer', triggerTurn: true },
+        )
+      },
+    })
+    watches.set(sessionId, watch)
+    request.observer.completion.then(() => setTimeout(() => { if (watch.stopped) watches.delete(sessionId) }, 1000), () => {})
+  }
+
   // The workspace owner may supply an execution backend. Resolve per call so
   // changing SSH targets never relies on extension registration order.
   pi.events.on('codex-tools:capabilities', (value: unknown) => {
@@ -903,9 +967,14 @@ export default function codexTools(pi: ExtensionAPI) {
         if (!request.execute && params.environment_id !== undefined && params.environment_id !== 'local') {
           throw new Error('No active workspace backend for the requested environment_id')
         }
-        return request.execute
+        const result = await (request.execute
           ? request.execute()
-          : definition.execute(id, params, signal, onUpdate, ctx)
+          : definition.execute(id, params, signal, onUpdate, ctx))
+        const sessionId = (result as { details?: { session_id?: unknown } })?.details?.session_id
+        if (definition.name === 'exec_command' && typeof sessionId === 'number') {
+          watchSession(sessionId, String(params.cmd ?? ''))
+        }
+        return result
       },
     })
   }
@@ -975,7 +1044,7 @@ export default function codexTools(pi: ExtensionAPI) {
     name: 'exec_command',
     label: 'Exec Command',
     description:
-      'Runs a command in a PTY, returning output or a session ID for ongoing interaction.',
+      'Runs a command in a PTY, returning output or a session ID for ongoing interaction. A command still running after yield_time_ms keeps running: this session is woken every 30 minutes with its new output and once when it exits, with the session ID. Do not poll it with write_stdin unless you need output or input now.',
     promptSnippet:
       'Run a shell command and receive Codex-style output or a `session_id` for follow-up `write_stdin` calls.',
     parameters: execCommandSchema,
@@ -1114,6 +1183,8 @@ File references can only be relative, never absolute.`,
   registerModelToolSelection(pi)
 
   pi.on('session_shutdown', async (_event, ctx) => {
+    for (const watch of watches.values()) watch.stop()
+    watches.clear()
     for (const session of runningSessions.values()) {
       session.killed = true
       session.child.kill('SIGTERM')
