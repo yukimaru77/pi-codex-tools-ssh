@@ -158,7 +158,7 @@ const execCommandSchema = Type.Object(
     yield_time_ms: Type.Optional(
       Type.Number({
         description:
-          'How long to wait (in milliseconds) for output before yielding.',
+          'How long to wait (in milliseconds) for the command before yielding. Default 10000 (10 seconds); a command still running after it keeps running and reports back on its own.',
       }),
     ),
     max_output_tokens: Type.Optional(
@@ -1044,7 +1044,7 @@ export default function codexTools(pi: ExtensionAPI) {
     name: 'exec_command',
     label: 'Exec Command',
     description:
-      'Runs a command in a PTY, returning output or a session ID for ongoing interaction. A command still running after yield_time_ms keeps running: this session is woken every 30 minutes with its new output and once when it exits, with the session ID. Do not poll it with write_stdin unless you need output or input now.',
+      'Runs a command in a PTY, returning output or a session ID for ongoing interaction. It waits up to yield_time_ms (10 seconds by default). A command still running then keeps running: you get its output so far and a session ID, this session is woken every 30 minutes with its new output and once when it exits. Continue with other work instead of polling it with write_stdin; use write_stdin only when you need its output or must send input now. For output you want to react to as it appears (logs, dev servers, CI), use monitor_start, filtered to the lines that matter.',
     promptSnippet:
       'Run a shell command and receive Codex-style output or a `session_id` for follow-up `write_stdin` calls.',
     parameters: execCommandSchema,
