@@ -36,7 +36,7 @@ test('a still-running exec_command gets guidance, a session log, the footer, exe
   assert.equal(typeof id, 'number')
   assert.match(out, /Process running with session ID/)
   assert.match(out, /woken with its new output every 10 minutes and once when it exits/)
-  assert.match(out, /Do not poll it with write_stdin or sleep/)
+  assert.match(out, /end your turn now with a short status reply/)
   const log = out.match(/Full output so far is in (\S+)/)[1]
   assert.match(readFileSync(log, 'utf8'), /first/)
   assert.equal(h.status['codex-exec'], 'exec: 1 running')

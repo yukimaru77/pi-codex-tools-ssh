@@ -60,8 +60,9 @@ configuration are changed.
 `exec_command` waits `yield_time_ms` (10 s by default) and returns the output and exit
 code of a command that finishes in time. A command still running then keeps running in
 the background; its result carries the `session_id`, the path of the session's full log,
-and guidance: do not poll it, keep working on whatever can proceed in parallel, and only
-wait when nothing at all can be started. The session then wakes Pi on its own, chosen with
+and guidance: do not poll it, keep working on whatever can proceed in parallel, and when
+nothing at all can be started, end the turn with a short status reply (the notification starts
+the next turn) instead of running `sleep`, `wait` or a polling loop. The session then wakes Pi on its own, chosen with
 `notify`:
 
 | `notify` | Wakes the session |
