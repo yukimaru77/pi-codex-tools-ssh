@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent'
 
-export const CODEX_TOOL_NAMES = ['exec_command', 'write_stdin', 'apply_patch', 'view_image'] as const
+export const CODEX_TOOL_NAMES = ['exec_command', 'write_stdin', 'exec_list', 'exec_stop', 'apply_patch', 'view_image'] as const
 /** Registered for compatibility but never activated: exec_command covers them. */
 export const LEGACY_SHELL_TOOL_NAMES = ['shell', 'local_shell', 'shell_command'] as const
 export const STANDARD_TOOL_NAMES = ['bash', 'edit', 'write'] as const

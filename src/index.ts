@@ -1,5 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { createWriteStream, statSync, type WriteStream } from 'node:fs'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -17,7 +18,19 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { type Static, Type } from 'typebox'
 import { registerModelToolSelection, TOOL_STATUS_KEY } from './model-tool-selection.ts'
-import { ExecWatch, type ExecObserver, formatNotice, logFileReader, type SessionState } from './exec-watch.ts'
+import {
+  backgroundGuidance,
+  DEFAULT_REPORT_INTERVAL_MS,
+  ExecWatch,
+  type ExecObserver,
+  formatNotice,
+  LineCounter,
+  logFileReader,
+  logLineCount,
+  NOTIFY_MODES,
+  type NotifyMode,
+  type SessionState,
+} from './exec-watch.ts'
 
 const DEFAULT_EXEC_YIELD_TIME_MS = 10_000
 const DEFAULT_WRITE_STDIN_YIELD_TIME_MS = 250
@@ -158,7 +171,13 @@ const execCommandSchema = Type.Object(
     yield_time_ms: Type.Optional(
       Type.Number({
         description:
-          'How long to wait (in milliseconds) for the command before yielding. Default 10000 (10 seconds); a command still running after it keeps running and reports back on its own.',
+          'How long to wait (in milliseconds) for the command before yielding. Default 10000 (10 seconds). If you expect the command to finish soon (e.g. a test run of about two minutes), set it long enough to get the result in one call; a command still running after it keeps running in the background and reports back on its own.',
+      }),
+    ),
+    notify: Type.Optional(
+      Type.Union([Type.Literal('interval'), Type.Literal('output'), Type.Literal('exit')], {
+        description:
+          'How a command still running after yield_time_ms wakes this session. "interval" (default): every 10 minutes with its new output, and once on exit. "output": as soon as each burst of new output appears (for logs, dev servers, CI you must react to; filter the command, e.g. grep --line-buffered, so only relevant lines print), and once on exit. "exit": only once, when it exits.',
       }),
     ),
     max_output_tokens: Type.Optional(
@@ -258,6 +277,11 @@ interface RunningSession {
   exitCode: number | null | undefined
   killed: boolean
   done: Promise<void>
+  /** Full output, kept on disk so omitted lines of reports stay readable. */
+  logPath: string
+  log: WriteStream
+  lines: LineCounter
+  lastOutputAt?: number
 }
 
 interface SpawnResult {
@@ -366,6 +390,7 @@ async function persistFullOutput(output: string): Promise<string> {
 async function formatOutput(
   output: string,
   maxOutputTokens?: number,
+  log?: { path: string; offset: number },
 ): Promise<{
   text: string
   truncation?: unknown
@@ -380,10 +405,12 @@ async function formatOutput(
     return { text: truncation.content }
   }
 
-  const fullOutputPath = await persistFullOutput(output)
-  const startLine = truncation.totalLines - truncation.outputLines + 1
-  const endLine = truncation.totalLines
-  const notice = `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}). Full output: ${fullOutputPath}]`
+  const fullOutputPath = log?.path ?? (await persistFullOutput(output))
+  const base = log?.offset ?? 0
+  const startLine = base + truncation.totalLines - truncation.outputLines + 1
+  const endLine = base + truncation.totalLines
+  const range = log ? `lines ${base + 1}-${endLine} of the session log` : `${truncation.totalLines} lines`
+  const notice = `\n\n[Showing lines ${startLine}-${endLine} of ${range} (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}). Full output: ${fullOutputPath} (read it with \`read\` and offset/limit)]`
 
   return {
     text: `${truncation.content}${notice}`,
@@ -497,6 +524,7 @@ function spawnManagedSession(command: string[], cwd: string): RunningSession {
     env: process.env,
     windowsHide: true,
   })
+  const logPath = path.join(tmpdir(), `pi-exec-${process.pid}-${id}.log`)
   const session: RunningSession = {
     id,
     child,
@@ -506,21 +534,28 @@ function spawnManagedSession(command: string[], cwd: string): RunningSession {
     exitCode: undefined,
     killed: false,
     done: Promise.resolve(),
+    logPath,
+    log: createWriteStream(logPath, { mode: 0o600 }),
+    lines: new LineCounter(),
+  }
+  session.log.on('error', () => {})
+  const append = (text: string) => {
+    session.output += text
+    session.lines.write(text)
+    session.lastOutputAt = Date.now()
+    session.log.write(text)
   }
 
   session.done = new Promise((resolve) => {
-    child.stdout.on('data', (chunk: Buffer) => {
-      session.output += chunk.toString('utf8')
-    })
-    child.stderr.on('data', (chunk: Buffer) => {
-      session.output += chunk.toString('utf8')
-    })
+    child.stdout.on('data', (chunk: Buffer) => append(chunk.toString('utf8')))
+    child.stderr.on('data', (chunk: Buffer) => append(chunk.toString('utf8')))
     child.on('error', (error) => {
-      session.output += `\n${error.message}\n`
+      append(`\n${error.message}\n`)
       session.exitCode = 1
     })
     child.on('close', (exitCode) => {
       session.exitCode = exitCode
+      session.log.end()
       resolve()
     })
   })
@@ -556,8 +591,10 @@ async function buildUnifiedExecResult(
   details: UnifiedExecDetails
 }> {
   const unreadOutput = session.output.slice(session.readOffset)
+  // Line numbers are 1-based in the session log; the unread text starts after these complete lines.
+  const linesBefore = (session.output.slice(0, session.readOffset).match(/\n/g) ?? []).length
   session.readOffset = session.output.length
-  const formatted = await formatOutput(unreadOutput, maxOutputTokens)
+  const formatted = await formatOutput(unreadOutput, maxOutputTokens, { path: session.logPath, offset: linesBefore })
   const wallTimeSeconds = (Date.now() - startedAt) / 1000
   const stillRunning = session.exitCode === undefined
 
@@ -567,7 +604,9 @@ async function buildUnifiedExecResult(
 
   const sections = [`Wall time: ${wallTimeSeconds.toFixed(4)} seconds`]
   if (session.exitCode !== undefined) {
-    sections.push(`Process exited with code ${session.exitCode ?? 0}`)
+    sections.push(session.exitCode === null && session.killed
+      ? 'Process was terminated by a signal (stopped)'
+      : `Process exited with code ${session.exitCode ?? 0}`)
   }
   if (stillRunning) {
     sections.push(`Process running with session ID ${session.id}`)
@@ -893,26 +932,70 @@ function localObserver(session: RunningSession): ExecObserver {
   }
 }
 
+const EXEC_STATUS_KEY = 'codex-exec'
+const STOP_GRACE_MS = 3_000
+
+interface TrackedSession {
+  id: number
+  command: string
+  startedAt: number
+  workspace: string
+  mode: NotifyMode
+  logPath?: string
+  lineCount?: () => number
+  lastOutputAt?: number
+  state(): SessionState
+  watch: ExecWatch
+  stoppedByUser?: boolean
+}
+
+function logModified(logPath: string | undefined): number | undefined {
+  if (!logPath) return undefined
+  try {
+    const stat = statSync(logPath)
+    return stat.size > 0 ? stat.mtimeMs : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function duration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, '0')}s`
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`
+}
+
 export default function codexTools(pi: ExtensionAPI) {
   // A long exec_command session keeps running after its yield and reports back
-  // on its own: every 30 minutes with new output and once when it exits.
+  // on its own (see NotifyMode); exec_list / exec_stop / /execs manage them.
   const watches = new Map<number, ExecWatch>()
+  const tracked = new Map<number, TrackedSession>()
   let notificationSequence = 0
+  let uiContext: ExtensionContext | undefined
+  const isRunning = (entry: TrackedSession) => !entry.state().done && !entry.stoppedByUser
+  const updateExecStatus = () => {
+    if (!uiContext?.hasUI) return
+    const running = [...tracked.values()].filter(isRunning).length
+    uiContext.ui.setStatus(EXEC_STATUS_KEY, running ? `exec: ${running} running` : undefined)
+  }
   pi.events.on('codex-tools:observe', (value: unknown) => {
     const request = value as { protocolVersion?: number; session_id?: number; observer?: ExecObserver }
     if (!request || request.protocolVersion !== 1 || request.observer) return
     const session = runningSessions.get(Number(request.session_id))
     if (session) request.observer = localObserver(session)
   })
-  // Additive so pi-event-monitor's path watchers and these sessions both count for goal waits.
+  // Running background sessions are the wake sources pi-goal-x GOAL_WAIT waits on.
   pi.events.on('pi-monitor:query', (value: unknown) => {
     const query = value as { active?: number; sequence?: number }
     if (!query || typeof query !== 'object') return
     query.active = (query.active ?? 0) + [...watches.values()].filter(watch => !watch.stopped).length
     query.sequence = (query.sequence ?? 0) + notificationSequence
   })
-  function watchSession(sessionId: number, command: string) {
-    if (watches.has(sessionId)) return
+  function watchSession(sessionId: number, command: string, mode: NotifyMode): TrackedSession | undefined {
+    const existing = tracked.get(sessionId)
+    if (existing) return existing
     // A backend answers with a ready observer, or (SSH) with the local log of the session.
     const request: {
       protocolVersion: number
@@ -921,25 +1004,97 @@ export default function codexTools(pi: ExtensionAPI) {
       log?: { path: string; completion: Promise<void>; state(): SessionState; consumedByAgent(): boolean }
     } = { protocolVersion: 1, session_id: sessionId }
     pi.events.emit('codex-tools:observe', request)
-    if (!request.observer && request.log) {
-      const { path: logPath, completion, state, consumedByAgent } = request.log
-      request.observer = { read: logFileReader(logPath), completion, state, consumedByAgent }
+    const local = runningSessions.get(sessionId)
+    let logPath: string | undefined
+    let lineCount: (() => number) | undefined
+    if (local) {
+      logPath = local.logPath
+      lineCount = () => local.lines.total
+    } else if (request.log) {
+      logPath = request.log.path
+      lineCount = logLineCount(request.log.path)
     }
-    if (!request.observer) return
-    const watch = new ExecWatch({
-      sessionId, command, observer: request.observer,
+    if (!request.observer && request.log) {
+      const { path: logFile, completion, state, consumedByAgent } = request.log
+      request.observer = { read: logFileReader(logFile), completion, state, consumedByAgent }
+    }
+    if (!request.observer) return undefined
+    const observer = request.observer
+    const entry = {
+      id: sessionId, command, startedAt: local?.startedAt ?? Date.now(),
+      workspace: sessionId < 0 ? 'ssh' : 'local', mode, logPath, lineCount,
+      state: () => observer.state(),
+    } as TrackedSession
+    entry.watch = new ExecWatch({
+      sessionId, command, observer, mode, logPath, lineCount,
+      onOutput: () => { entry.lastOutputAt = Date.now() },
       notify(notice) {
         if (notice.final) watches.delete(sessionId)
         const sequence = ++notificationSequence
         pi.events.emit('pi-monitor:notification', { id: `exec-${sessionId}`, sequence })
         pi.sendMessage(
-          { customType: 'monitor-event', content: formatNotice(notice), display: true, details: { sessionId, command, lines: notice.lines, final: notice.final, sequence } },
+          { customType: 'monitor-event', content: formatNotice(notice, mode, DEFAULT_REPORT_INTERVAL_MS), display: true, details: { sessionId, command, lines: notice.lines, range: notice.range, logPath: notice.logPath, final: notice.final, sequence } },
           { deliverAs: 'steer', triggerTurn: true },
         )
+        updateExecStatus()
       },
     })
-    watches.set(sessionId, watch)
-    request.observer.completion.then(() => setTimeout(() => { if (watch.stopped) watches.delete(sessionId) }, 1000), () => {})
+    watches.set(sessionId, entry.watch)
+    tracked.set(sessionId, entry)
+    observer.completion.then(() => setTimeout(() => {
+      if (entry.watch.stopped) watches.delete(sessionId)
+      updateExecStatus()
+    }, 1000), () => {})
+    updateExecStatus()
+    return entry
+  }
+
+  function listSessions(status: 'running' | 'exited' | 'all'): string {
+    const now = Date.now()
+    const rows = [...tracked.values()]
+      .filter(entry => status === 'all' || (status === 'running' ? isRunning(entry) : !isRunning(entry)))
+      .map(entry => {
+        const state = entry.state()
+        const condition = entry.stoppedByUser ? 'stopped' : state.done ? `exited ${state.exitCode ?? 'null'}` : 'running'
+        const lastAt = runningSessions.get(entry.id)?.lastOutputAt ?? logModified(entry.logPath) ?? entry.lastOutputAt
+        const last = lastAt ? `${duration(now - lastAt)} ago` : 'none yet'
+        const lines = entry.lineCount?.()
+        return [
+          `session ${entry.id} [${condition}] ${entry.workspace}, started ${duration(now - entry.startedAt)} ago, last output ${last}, notify ${entry.mode}`,
+          `  cmd: ${entry.command}`,
+          entry.logPath ? `  log: ${entry.logPath}${lines !== undefined ? ` (${lines} lines)` : ''}` : undefined,
+        ].filter(Boolean).join('\n')
+      })
+    if (!rows.length) return status === 'running' ? 'No background exec_command sessions are running.' : `No ${status === 'all' ? '' : `${status} `}background exec_command sessions.`
+    return rows.join('\n')
+  }
+
+  async function stopSession(entry: TrackedSession, signal?: AbortSignal): Promise<string> {
+    entry.watch.stop()
+    watches.delete(entry.id)
+    entry.stoppedByUser = true
+    const local = runningSessions.get(entry.id)
+    if (local) {
+      local.killed = true
+      if (local.exitCode === undefined) local.child.kill('SIGTERM')
+      await Promise.race([local.done, wait(STOP_GRACE_MS, signal)])
+      if (local.exitCode === undefined) {
+        local.child.kill('SIGKILL')
+        await Promise.race([local.done, wait(STOP_GRACE_MS, signal)])
+      }
+      const result = await buildUnifiedExecResult(local, Date.now(), undefined)
+      return `Stopped session ${entry.id} (${entry.command}).\n${result.content[0]?.text ?? ''}`
+    }
+    if (entry.state().done) return `Session ${entry.id} had already exited (code ${entry.state().exitCode ?? 'null'}).`
+    // SSH sessions are owned by the SSH backend; interrupt them through their own write_stdin.
+    const request: { protocolVersion: number; name: string; params: any; signal?: AbortSignal; execute?: () => Promise<any> } = {
+      protocolVersion: 1, name: 'write_stdin', params: { session_id: entry.id, chars: '\u0003', yield_time_ms: STOP_GRACE_MS }, signal,
+    }
+    pi.events.emit('codex-tools:resolve', request)
+    if (!request.execute) return `Session ${entry.id} belongs to a workspace backend that is no longer available; it could not be interrupted.`
+    const result = await request.execute()
+    const text = (result?.content ?? []).map((part: { text?: string }) => part.text ?? '').join('\n')
+    return `Sent Ctrl-C to SSH session ${entry.id} (${entry.command}); no further reports will be sent for it.\n${text}`
   }
 
   // The workspace owner may supply an execution backend. Resolve per call so
@@ -967,12 +1122,19 @@ export default function codexTools(pi: ExtensionAPI) {
         if (!request.execute && params.environment_id !== undefined && params.environment_id !== 'local') {
           throw new Error('No active workspace backend for the requested environment_id')
         }
+        uiContext = ctx
         const result = await (request.execute
           ? request.execute()
           : definition.execute(id, params, signal, onUpdate, ctx))
         const sessionId = (result as { details?: { session_id?: unknown } })?.details?.session_id
         if (definition.name === 'exec_command' && typeof sessionId === 'number') {
-          watchSession(sessionId, String(params.cmd ?? ''))
+          const mode: NotifyMode = NOTIFY_MODES.includes(params.notify) ? params.notify : 'interval'
+          const entry = watchSession(sessionId, String(params.cmd ?? ''), mode)
+          const content = (result as { content?: { type: string; text?: string }[] }).content
+          const textPart = content?.find(part => part.type === 'text')
+          if (entry && textPart) {
+            textPart.text = `${(textPart.text ?? '').replace(/\s+$/, '')}\n\n${backgroundGuidance(sessionId, mode)}${entry.logPath ? `\nFull output so far is in ${entry.logPath} (read it with \`read\` and offset/limit).` : ''}`
+          }
         }
         return result
       },
@@ -1044,7 +1206,7 @@ export default function codexTools(pi: ExtensionAPI) {
     name: 'exec_command',
     label: 'Exec Command',
     description:
-      'Runs a command in a PTY, returning output or a session ID for ongoing interaction. It waits up to yield_time_ms (10 seconds by default). A command still running then keeps running: you get its output so far and a session ID, this session is woken every 30 minutes with its new output and once when it exits. Continue with other work instead of polling it with write_stdin; use write_stdin only when you need its output or must send input now. For output you want to react to as it appears (logs, dev servers, CI), use monitor_start, filtered to the lines that matter.',
+      'Runs a shell command (plain pipes, no TTY) and returns its output and exit code, or a session ID if it is still running. It waits up to yield_time_ms (10 seconds by default). A command still running then keeps running in the background and wakes this session on its own with its output: by default every 10 minutes and once when it exits; notify="output" wakes on each burst of new output (logs, dev servers, CI you must react to; filter the command, e.g. grep --line-buffered), notify="exit" only on exit. Do not poll a background session with write_stdin or sleep: work on anything else that can proceed in parallel, and only if nothing at all can be started, wait for the notification. Use write_stdin only to send input or when you need its output now. Reports show the first and last lines; the full output is in the session log they name (read it with `read`). List sessions with exec_list and stop ones you no longer need (e.g. dev servers) with exec_stop.',
     promptSnippet:
       'Run a shell command and receive Codex-style output or a `session_id` for follow-up `write_stdin` calls.',
     parameters: execCommandSchema,
@@ -1180,11 +1342,80 @@ File references can only be relative, never absolute.`,
     },
   })
 
+  pi.registerTool({
+    name: 'exec_list',
+    label: 'Exec List',
+    description:
+      'List exec_command sessions that kept running in the background after their yield: session id, state (running / exited with code / stopped), workspace, age, time since last output, notify mode, command and full log path.',
+    promptSnippet: 'List background exec_command sessions and their logs.',
+    parameters: Type.Object(
+      {
+        status: Type.Optional(
+          Type.Union([Type.Literal('running'), Type.Literal('exited'), Type.Literal('all')], {
+            description: 'Which sessions to list. Default "running".',
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      uiContext = ctx
+      const text = listSessions(params.status ?? 'running')
+      return { content: [{ type: 'text', text }], details: { status: params.status ?? 'running' } }
+    },
+  })
+
+  pi.registerTool({
+    name: 'exec_stop',
+    label: 'Exec Stop',
+    description:
+      'Stop a background exec_command session (or all of them) that is no longer needed. Local sessions get SIGTERM, then SIGKILL after 3 seconds; SSH sessions get Ctrl-C. Returns the remaining output and exit status; no further reports are sent for stopped sessions.',
+    promptSnippet: 'Stop background exec_command sessions that are no longer needed.',
+    parameters: Type.Object(
+      {
+        session_id: Type.Optional(Type.Number({ description: 'Session to stop.' })),
+        all: Type.Optional(Type.Boolean({ description: 'Stop every running background session of this Pi process.' })),
+      },
+      { additionalProperties: false },
+    ),
+    executionMode: 'sequential',
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      uiContext = ctx
+      const targets = params.all
+        ? [...tracked.values()].filter(isRunning)
+        : params.session_id === undefined ? [] : [tracked.get(params.session_id)].filter(Boolean) as TrackedSession[]
+      if (!params.all && params.session_id === undefined) throw new Error('exec_stop needs session_id or all=true')
+      if (!params.all && !targets.length) throw new Error(`exec_stop: unknown background session ${params.session_id}; see exec_list`)
+      const texts: string[] = []
+      for (const entry of targets) texts.push(await stopSession(entry, signal))
+      updateExecStatus()
+      return { content: [{ type: 'text', text: texts.join('\n\n') || 'No background sessions were running.' }], details: { stopped: targets.map(entry => entry.id) } }
+    },
+  })
+
+  pi.registerCommand('execs', {
+    description: 'Show background exec_command sessions: /execs [running|exited|all]',
+    handler: async (args, ctx) => {
+      uiContext = ctx
+      const word = args.trim()
+      const status = word === 'all' || word === 'exited' ? word : 'running'
+      ctx.ui.notify(listSessions(status), 'info')
+      updateExecStatus()
+    },
+  })
+
+  pi.on('session_start', (_event, ctx) => {
+    uiContext = ctx
+    updateExecStatus()
+  })
+
   registerModelToolSelection(pi)
 
   pi.on('session_shutdown', async (_event, ctx) => {
     for (const watch of watches.values()) watch.stop()
     watches.clear()
+    tracked.clear()
+    if (ctx.hasUI) ctx.ui.setStatus(EXEC_STATUS_KEY, undefined)
     for (const session of runningSessions.values()) {
       session.killed = true
       session.child.kill('SIGTERM')
