@@ -255,7 +255,7 @@ export function wakeSchedule(mode: NotifyMode, intervalMs = DEFAULT_REPORT_INTER
 export function backgroundGuidance(sessionId: number, mode: NotifyMode, intervalMs = DEFAULT_REPORT_INTERVAL_MS): string {
   return [
     `The process keeps running in the background. This session will be woken with its new output ${wakeSchedule(mode, intervalMs)}.`,
-    'Work on anything else that can proceed in parallel. Only if, after careful thought, nothing at all can be started, end your turn now with a short status reply: the notification starts your next turn automatically. Never wait by running sleep, wait, or a polling loop, and never call write_stdin just to check on it.',
+    'Work on anything else that can proceed in parallel. Only if, after careful thought, nothing at all can be started, end your turn now with a short status reply (with an active goal, end it with GOAL_WAIT): the notification starts your next turn automatically. Never wait by running sleep, wait, or a polling loop, and never call write_stdin just to check on it.',
     `List background sessions with exec_list; stop this one with exec_stop {"session_id": ${sessionId}} when it is no longer needed.`,
   ].join('\n')
 }

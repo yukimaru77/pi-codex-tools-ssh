@@ -114,7 +114,7 @@ test('notify "output" wakes on each burst; notify "exit" only on exit', async ()
 test('background guidance tells the agent to keep working and how to stop', () => {
   const text = backgroundGuidance(9, 'interval')
   assert.match(text, /woken with its new output every 10 minutes and once when it exits/)
-  assert.match(text, /Only if, after careful thought, nothing at all can be started, end your turn now with a short status reply: the notification starts your next turn automatically/)
+  assert.match(text, /Only if, after careful thought, nothing at all can be started, end your turn now with a short status reply \(with an active goal, end it with GOAL_WAIT\): the notification starts your next turn automatically/)
   assert.match(text, /Never wait by running sleep, wait, or a polling loop/)
   assert.doesNotMatch(text, /wait for the notification/)
   assert.match(text, /exec_stop \{"session_id": 9\}/)
