@@ -974,6 +974,8 @@ export default function codexTools(pi: ExtensionAPI) {
   const tracked = new Map<number, TrackedSession>()
   let notificationSequence = 0
   let uiContext: ExtensionContext | undefined
+  let active = true
+  const statusTimers = new Set<ReturnType<typeof setTimeout>>()
   const isRunning = (entry: TrackedSession) => !entry.state().done && !entry.stoppedByUser
   const updateExecStatus = () => {
     if (!uiContext?.hasUI) return
@@ -1041,10 +1043,16 @@ export default function codexTools(pi: ExtensionAPI) {
     })
     watches.set(sessionId, entry.watch)
     tracked.set(sessionId, entry)
-    observer.completion.then(() => setTimeout(() => {
-      if (entry.watch.stopped) watches.delete(sessionId)
-      updateExecStatus()
-    }, 1000), () => {})
+    observer.completion.then(() => {
+      if (!active) return
+      const timer = setTimeout(() => {
+        statusTimers.delete(timer)
+        if (!active) return
+        if (entry.watch.stopped) watches.delete(sessionId)
+        updateExecStatus()
+      }, 1000)
+      statusTimers.add(timer)
+    }, () => {})
     updateExecStatus()
     return entry
   }
@@ -1412,6 +1420,10 @@ File references can only be relative, never absolute.`,
   registerModelToolSelection(pi)
 
   pi.on('session_shutdown', async (_event, ctx) => {
+    active = false
+    uiContext = undefined
+    for (const timer of statusTimers) clearTimeout(timer)
+    statusTimers.clear()
     for (const watch of watches.values()) watch.stop()
     watches.clear()
     tracked.clear()

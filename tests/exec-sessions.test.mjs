@@ -68,3 +68,19 @@ test('notify "exit" reports only on exit, with the session log line range', asyn
   assert.match(notice, /lines 1-3 of the session log/)
   assert.match(notice, /\| c\n\| Process exited with code 0/)
 })
+
+test('late completion cannot access an invalidated context after shutdown', async () => {
+  const h = host()
+  await h.call('exec_command', { cmd: 'echo started; sleep 30', yield_time_ms: 100, login: false })
+  await h.shutdown()
+  let staleReads = 0
+  Object.defineProperty(h.ctx, 'hasUI', { get() {
+    staleReads++
+    throw new Error('extension ctx is stale')
+  } })
+  // Killing the child resolves its completion after the shutdown handler.
+  // Its delayed footer callback must not survive runtime disposal.
+  await delay(1400)
+  assert.equal(staleReads, 0)
+  assert.equal(h.sent.length, 0)
+})
